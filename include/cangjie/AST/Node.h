@@ -24,6 +24,7 @@
 #include <unordered_set>
 #include <variant>
 #include <vector>
+#include <algorithm>
 
 #include "cangjie/AST/AttributePack.h"
 #include "cangjie/AST/Comment.h"
@@ -1984,6 +1985,7 @@ struct TryExpr : Expr {
         }
 
         return false;
+        // return handlers | std::ranges::any_of([](auto& h) { return !h.IsImmediate(); });
     }
 };
 
