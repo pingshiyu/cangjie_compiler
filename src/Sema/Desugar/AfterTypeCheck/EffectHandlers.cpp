@@ -92,7 +92,7 @@ Ptr<FuncDecl> GetDefaultInitDecl(ClassDecl& classDecl)
  * From:
  * { (<args>) => <body> }
  *
- * To (immediate):
+ * To:
  * { (<args>) =>
  *      try {
  *          <body>
@@ -120,39 +120,16 @@ Ptr<FuncDecl> GetDefaultInitDecl(ClassDecl& classDecl)
  *          }
  *      }
  * }
- *
- * To (deferred):
- * { (<args>) =>
- *      try {
- *          Return(<body>)
- *      } catch (e: ImmediateFrameExceptionWrapper) {
- *          if (HandlerFrame.getActiveFrame() == v.frame) {
- *              Throw(v.exception)
- *          } else {
- *              Throw(v)
- *          }
- *      } catch (e: ImmediateFrameErrorWrapper) {
- *          if (HandlerFrame.getActiveFrame() == v.frame) {
- *              Throw(v.error)
- *          } else {
- *              Throw(v)
- *          }
- *      } catch (e: ImmediateEarlyReturn) {
- *          if (HandlerFrame.getActiveFrame() == e.frame) {
- *              // This is similar to a desugared `(e.result as T).getOrThrow`
- *              match (e.result) {
- *                  case newVar : T => Return(newVar)
- *                  case _ => Throw(Exception())
- *              }
- *          } else {
- *              Throw(e)
- *          }
- *      }
- * }
  */
-void TypeChecker::TypeCheckerImpl::EncloseTryLambda(ASTContext& ctx, OwnedPtr<AST::LambdaExpr>& tryLambda, OwnedPtr<AST::Block>& tryBlock, bool isDeferred)
+void TypeChecker::TypeCheckerImpl::EncloseTryLambda(ASTContext& ctx, OwnedPtr<AST::LambdaExpr>& tryLambda)
 {
     OwnedPtr<AST::Block> innerBlock = std::move(tryLambda->funcBody->body);
+
+    // `try { ... }
+    auto tryExpr = MakeOwnedNode<TryExpr>();
+    CopyBasicInfo(innerBlock, tryExpr);
+    tryExpr->tryBlock = std::move(innerBlock);
+    tryExpr->ty = tryLambda->funcBody->retType->ty.get();
 
     // Import declarations and types
     // stdx.effect.ImmediateFrameExceptionWrapper
@@ -169,81 +146,6 @@ void TypeChecker::TypeCheckerImpl::EncloseTryLambda(ASTContext& ctx, OwnedPtr<AS
     auto earlyReturnDecl = importManager.GetImportedDecl<ClassDecl>(EFFECT_INTERNALS_PACKAGE_NAME, CLASS_EARLY_RETURN);
     CJC_NULLPTR_CHECK(earlyReturnDecl);
     auto earlyReturnTy = typeManager.GetClassTy(*earlyReturnDecl, {});
-    // stdx.effect.HandlerRequest
-    auto handlerRequestDecl = importManager.GetImportedDecl<EnumDecl>(EFFECT_INTERNALS_PACKAGE_NAME, "HandlerRequest");
-    CJC_NULLPTR_CHECK(handlerRequestDecl);
-    auto handlerRequestTy = typeManager.GetEnumTy(*handlerRequestDecl, {tryLambda->funcBody->retType->ty.get()});
-    // std.core.Exception
-    auto exceptionDecl = importManager.GetCoreDecl<ClassDecl>(CLASS_EXCEPTION);
-    CJC_NULLPTR_CHECK(exceptionDecl);
-    auto exceptionType = exceptionDecl->ty;
-
-    Ptr<FuncDecl> returnDecl, throwDecl;
-
-    for (auto& decl: handlerRequestDecl->constructors) {
-        std::count << decl->identifier.Val() << std::endl;
-        if (decl->astKind == ASTKind::FUNC_DECL && decl->identifier.Val() == "Return") {
-            std::count << "Found Return" << std::endl;
-            returnDecl = std::move(StaticCast<FuncDecl*>(decl.get()));
-        }
-        if (decl->astKind == ASTKind::FUNC_DECL && decl->identifier.Val() == "Throw") {
-            std::count << "Found Throw" << std::endl;
-            throwDecl = std::move(StaticCast<FuncDecl*>(decl.get()));
-        }
-    }
-
-    CJC_ASSERT(returnDecl && Ty::IsTyCorrect(returnDecl->ty) && returnDecl->ty->IsFunc());
-    CJC_ASSERT(throwDecl && Ty::IsTyCorrect(throwDecl->) && throwDecl->ty->IsFunc());
-
-    // `try { ... }
-    auto tryExpr = MakeOwnedNode<TryExpr>();
-    CopyBasicInfo(innerBlock, tryExpr);
-    if (isDeferred) {
-        OwnedPtr<RefExpr> re2 = CreateRefExpr("Return");
-        re2->isAlone = false;
-        re2->ref.target = returnDecl;
-        re2->ty = returnDecl->ty;
-
-        CJC_ASSERT(re2->ref.target);
-        re2->ref.targets.emplace_back(StaticCast<FuncDecl*>(re2->ref.target));
-
-        CopyBasicInfo(innerBlock, re2.get());
-
-        // (<body>)
-        std::vector<OwnedPtr<FuncArg>> args;
-        auto funcArg = CreateFuncArg(std::move(tryBlock));
-        SynthesizeWithoutRecover({ctx, SynPose::NONE}, funcArg.get());
-
-        args.emplace_back(std::move(funcArg));
-
-        // Return(<body>)
-        auto returnCreation = AST::CreateCallExpr(
-            std::move(re2),
-            std::move(args),
-            returnDecl,
-            handlerRequestTy,
-            CallKind::CALL_DECLARED_FUNCTION
-        );
-        CallBasicInfo(re2.get(), returnCreation);
-        returnCreation->desugarArgs = {};
-
-        auto typecheckOk = ChkCallExpr(ctx, handlerRequestTy, *returnCreation);
-        CJC_ASSERT(typecheckOk);
-
-        // { Return(<body>) }
-        std::vector<OwnedPtr<Cangjie::AST::Node>> nodes;
-        nodes.emplace_back(std::move(returnCreation));
-        auto resultBlock = CreateBlock(std::move(nodes));
-        resultBlock->ty = handlerRequestTy;
-
-        tryExpr->tryBlock = std::move(resultBlock);
-        tryExpr->ty = handlerRequestTy;
-    } else {
-        tryExpr->tryBlock = std::move(innerBlock);
-        tryExpr->ty = tryLambda->funcBody->retType->ty.get();
-    }
-
-    
 
     {
         // (v: ImmediateFrameExceptionWrapper)
@@ -273,9 +175,19 @@ void TypeChecker::TypeCheckerImpl::EncloseTryLambda(ASTContext& ctx, OwnedPtr<AS
         AST::CopyNodeScopeInfo(vExcRef, tryExpr);
         auto excAccess = CreateMemberAccess(std::move(vExcRef), "exception");
 
+        // throw v.exception
+        auto throwExcExpr = MakeOwned<ThrowExpr>();
+        throwExcExpr->expr = std::move(excAccess);
+        throwExcExpr->ty = TypeManager::GetNothingTy();
+
         // v
         auto vRef = CreateRefExpr(*vp->varDecl);
         AST::CopyNodeScopeInfo(vRef, tryExpr);
+
+        // throw v
+        auto throwExpr = MakeOwned<ThrowExpr>();
+        throwExpr->expr = std::move(vRef);
+        throwExpr->ty = TypeManager::GetNothingTy();
 
         // `if (HandlerFrame.getActiveFrame() == v.frame) {
         // `     throw v.exception
@@ -283,116 +195,11 @@ void TypeChecker::TypeCheckerImpl::EncloseTryLambda(ASTContext& ctx, OwnedPtr<AS
         // `     throw v
         // `}
         std::vector<OwnedPtr<Node>> thenBlockNodes;
-        if (isDeferred) {
-            // Throw
-            OwnedPtr<RefExpr> re2 = CreateRefExpr("Throw");
-            re2->isAlone = false;
-            re2->ref.target = throwDecl;
-            re2->ty = throwDecl->ty;
-
-            CJC_ASSERT(re2->ref.target);
-            re2->ref.targets.emplace_back(StaticCast<FuncDecl*>(re2->ref.target));
-
-            CopyBasicInfo(innerBlock, re2.get());
-
-            // We use this variable to be able to typecheck the call expression
-            auto exceptIndirectionVarDecl = CreateVarDecl(V_COMPILER, std::move(excAccess));
-            AST::CopyNodeScopeInfo(re2, exceptIndirectionVarDecl);
-            auto exceptIndirection = CreateRefExpr(*exceptIndirectionVarDecl);
-            exceptIndirection->ty = exceptionType;
-            AST::CopyNodeScopeInfo(re2, exceptIndirection);
-
-            // (v.exception)
-            std::vector<OwnedPtr<FuncArg>> args;
-            args.emplace_back(CreateFuncArg(std::move(exceptIndirection)));
-
-            // Throw(v.exception)
-            auto throwCreation = AST::CreateCallExpr(
-                std::move(re2),
-                std::move(args),
-                throwDecl,
-                handlerRequestTy,
-                CallKind::CALL_DECLARED_FUNCTION
-            );
-            CopyBasicInfo(re2.get(), throwCreation);
-            throwCreation->desugarArgs = {};
-
-            auto typecheckOk = ChkCallExpr(ctx, handlerRequestTy, *throwCreation);
-            CJC_ASSERT(typecheckOk);
-
-            // return Throw(ve.exception)
-            auto returnExpr2 = MakeOwnedNode<ReturnExpr>();
-            returnExpr2->expr = std::move(throwCreation);
-            returnExpr2->refFuncBody = tryLambda->funcBody;
-            CopyNodeScopeInfo(re2, returnExpr2);
-
-            (void)thenBlockNodes.emplace_back(std::move(exceptIndirectionVarDecl));
-            (void)thenBlockNodes.emplace_back(std::move(returnExpr2));
-        } else {
-            // throw v.exception
-            auto throwExcExpr = MakeOwned<ThrowExpr>();
-            throwExcExpr->expr = std::move(excAccess);
-            throwExcExpr->ty = TypeManager::GetNothingTy();
-            (void)thenBlockNodes.emplace_back(std::move(throwExcExpr));
-        }
-
+        (void)thenBlockNodes.emplace_back(std::move(throwExcExpr));
         auto thenBlock = CreateBlock(std::move(thenBlockNodes));
         thenBlock->ty = TypeManager::GetNothingTy();
 
         std::vector<OwnedPtr<Node>> elseBlockNodes;
-        if (isDeferred) {
-            // Throw
-            OwnedPtr<RefExpr> re2 = CreateRefExpr("Throw");
-            re2->isAlone = false;
-            re2->ref.target = throwDecl;
-            re2->ty = throwDecl->ty;
-
-            CJC_ASSERT(re2->ref.target);
-            (void)re2->ref.targets.emplace_back(StaticCast<FuncDecl*>(re2->ref.target));
-
-            CopyBasicInfo(innerBlock, re2.get());
-
-            // We use this variable to be able to typecheck the call expression
-            auto exceptIndirectionVarDecl = CreateVarDecl(V_COMPILER, std::move(vRef));
-            AST::CopyNodeScopeInfo(re2, exceptIndirectionVarDecl);
-            auto exceptIndirection = CreateRefExpr(*exceptIndirectionVarDecl);
-            exceptIndirection->ty = exceptionType;
-            AST::CopyNodeScopeInfo(re2, exceptIndirection);
-
-            // (v)
-            std::vector<OwnedPtr<FuncArg>> args;
-            args.emplace_back(CreateFuncArg(std::move(exceptIndirection)));
-
-            // Throw(v)
-            auto throwCreation = AST::CreateCallExpr(
-                std::move(re2),
-                std::move(args),
-                throwDecl,
-                handlerRequestTy,
-                CallKind::CALL_DECLARED_FUNCTION
-            );
-            CopyBasicInfo(re2.get(), throwCreation);
-            throwCreation->desugarArgs = {};
-
-            auto typecheckOk = ChkCallExpr(ctx, handlerRequestTy, *throwCreation);
-            CJC_ASSERT(typecheckOk);
-
-            // return Throw(v)
-            auto returnExpr2 = MakeOwnedNode<ReturnExpr>();
-            returnExpr2->expr = std::move(throwCreation);
-            returnExpr2->refFuncBody = tryLambda->funcBody;
-            CopyNodeScopeInfo(re2, returnExpr2);
-
-            (void)elseBlockNodes.emplace_back(std::move(exceptIndirectionVarDecl));
-            (void)elseBlockNodes.emplace_back(std::move(returnExpr2));
-        } else {
-            // throw v
-            auto throwExpr = MakeOwned<ThrowExpr>();
-            throwExpr->expr = std::move(vRef);
-            throwExpr->ty = TypeManager::GetNothingTy();
-
-            (void)elseBlockNodes.emplace_back(std::move(throwExpr));
-        }
         (void)elseBlockNodes.emplace_back(std::move(throwExpr));
         auto elseBlock = CreateBlock(std::move(elseBlockNodes));
         elseBlock->ty = TypeManager::GetNothingTy();
@@ -453,9 +260,19 @@ void TypeChecker::TypeCheckerImpl::EncloseTryLambda(ASTContext& ctx, OwnedPtr<AS
         AST::CopyNodeScopeInfo(vExcRef, tryExpr);
         auto excAccess = CreateMemberAccess(std::move(vExcRef), "error");
 
+        // throw v.error
+        auto throwExcExpr = MakeOwned<ThrowExpr>();
+        throwExcExpr->expr = std::move(excAccess);
+        throwExcExpr->ty = TypeManager::GetNothingTy();
+
         // v
         auto vRef = CreateRefExpr(*vp->varDecl);
         AST::CopyNodeScopeInfo(vRef, tryExpr);
+
+        // throw v
+        auto throwExpr = MakeOwned<ThrowExpr>();
+        throwExpr->expr = std::move(vRef);
+        throwExpr->ty = TypeManager::GetNothingTy();
 
         // `if (HandlerFrame.getActiveFrame() == v.frame) {
         // `     throw v.error
@@ -463,116 +280,12 @@ void TypeChecker::TypeCheckerImpl::EncloseTryLambda(ASTContext& ctx, OwnedPtr<AS
         // `     throw v
         // `}
         std::vector<OwnedPtr<Node>> thenBlockNodes;
-        if (isDeferred) {
-            // Throw
-            OwnedPtr<RefExpr> re2 = CreateRefExpr("Throw");
-            re2->isAlone = false;
-            re2->ref.target = throwDecl;
-            re2->ty = throwDecl->ty;
-
-            CJC_ASSERT(re2->ref.target);
-            (void)re2->ref.targets.emplace_back(StaticCast<FuncDecl*>(re2->ref.target));
-
-            CopyBasicInfo(innerBlock, re2.get());
-
-            // We use this variable to be able to typecheck the call expression
-            auto exceptIndirectionVarDecl = CreateVarDecl(V_COMPILER, std::move(excAccess));
-            AST::CopyNodeScopeInfo(re2, exceptIndirectionVarDecl);
-            auto exceptIndirection = CreateRefExpr(*exceptIndirectionVarDecl);
-            exceptIndirection->ty = exceptionType;
-            AST::CopyNodeScopeInfo(re2, exceptIndirection);
-
-            // (v.exception)
-            std::vector<OwnedPtr<FuncArg>> args;
-            args.emplace_back(CreateFuncArg(std::move(exceptIndirection)));
-
-            // Throw(v.exception)
-            auto throwCreation = AST::CreateCallExpr(
-                std::move(re2),
-                std::move(args),
-                throwDecl,
-                handlerRequestTy,
-                CallKind::CALL_DECLARED_FUNCTION
-            );
-            CopyBasicInfo(re2.get(), throwCreation);
-            throwCreation->desugarArgs = {};
-
-            auto typecheckOk = ChkCallExpr(ctx, handlerRequestTy, *throwCreation);
-            CJC_ASSERT(typecheckOk);
-
-            // return Throw(v)
-            auto returnExpr2 = MakeOwnedNode<ReturnExpr>();
-            returnExpr2->expr = std::move(throwCreation);
-            returnExpr2->refFuncBody = tryLambda->funcBody;
-            CopyNodeScopeInfo(re2, returnExpr2);
-
-            (void)elseBlockNodes.emplace_back(std::move(exceptIndirectionVarDecl));
-            (void)elseBlockNodes.emplace_back(std::move(returnExpr2));
-        } else {
-            // throw v.exception
-            auto throwExcExpr = MakeOwned<ThrowExpr>();
-            throwExcExpr->expr = std::move(excAccess);
-            throwExcExpr->ty = TypeManager::GetNothingTy();
-
-            (void)elseBlockNodes.emplace_back(std::move(throwExcExpr));
-        }
+        (void)thenBlockNodes.emplace_back(std::move(throwExcExpr));
         auto thenBlock = CreateBlock(std::move(thenBlockNodes));
         thenBlock->ty = TypeManager::GetNothingTy();
 
         std::vector<OwnedPtr<Node>> elseBlockNodes;
-        if (isDeferred) {
-            // Throw
-            OwnedPtr<RefExpr> re2 = CreateRefExpr("Throw");
-            re2->isAlone = false;
-            re2->ref.target = throwDecl;
-            re2->ty = throwDecl->ty;
-
-            CJC_ASSERT(re2->ref.target);
-            (void)re2->ref.targets.emplace_back(StaticCast<FuncDecl*>(re2->ref.target));
-
-            CopyBasicInfo(innerBlock, re2.get());
-
-            // We use this variable to be able to typecheck the call expression
-            auto exceptIndirectionVarDecl = CreateVarDecl(V_COMPILER, std::move(vRef));
-            AST::CopyNodeScopeInfo(re2, exceptIndirectionVarDecl);
-            auto exceptIndirection = CreateRefExpr(*exceptIndirectionVarDecl);
-            exceptIndirection->ty = exceptionType;
-            AST::CopyNodeScopeInfo(re2, exceptIndirection);
-
-            // (v.exception)
-            std::vector<OwnedPtr<FuncArg>> args;
-            args.emplace_back(CreateFuncArg(std::move(exceptIndirection)));
-
-            // Throw(v.exception)
-            auto throwCreation = AST::CreateCallExpr(
-                std::move(re2),
-                std::move(args),
-                throwDecl,
-                handlerRequestTy,
-                CallKind::CALL_DECLARED_FUNCTION
-            );
-            CopyBasicInfo(re2.get(), throwCreation);
-            throwCreation->desugarArgs = {};
-
-            auto typecheckOk = ChkCallExpr(ctx, handlerRequestTy, *throwCreation);
-            CJC_ASSERT(typecheckOk);
-
-            // return Throw(v.exception)
-            auto returnExpr2 = MakeOwnedNode<ReturnExpr>();
-            returnExpr2->expr = std::move(throwCreation);
-            returnExpr2->refFuncBody = tryLambda->funcBody;
-            CopyNodeScopeInfo(re2, returnExpr2);
-
-            (void)elseBlockNodes.emplace_back(std::move(exceptIndirectionVarDecl));
-            (void)elseBlockNodes.emplace_back(std::move(returnExpr2));
-        } else {
-            // throw v.exception
-            auto throwExpr = MakeOwned<ThrowExpr>();
-            throwExpr->expr = std::move(vRef);
-            throwExpr->ty = TypeManager::GetNothingTy();
-
-            (void)elseBlockNodes.emplace_back(std::move(throwExpr));
-        }
+        (void)elseBlockNodes.emplace_back(std::move(throwExpr));
         auto elseBlock = CreateBlock(std::move(elseBlockNodes));
         elseBlock->ty = TypeManager::GetNothingTy();
 
@@ -643,45 +356,8 @@ void TypeChecker::TypeCheckerImpl::EncloseTryLambda(ASTContext& ctx, OwnedPtr<AS
 
         // return newVar
         auto returnExpr = MakeOwnedNode<ReturnExpr>();
-        
-        if (isDeferred) {
-            // Return
-            OwnedPtr<RefExpr> re2 = CreateRefExpr("Return");
-            re2->isAlone = false;
-            re2->ref.target = returnDecl;
-            re2->ty = returnDecl->ty;
-
-            CJC_ASSERT(re2->ref.target);
-            re2->ref.targets.emplace_back(StaticCast<FuncDecl*>(re2->ref.target));
-
-            CopyBasicInfo(innerBlock, re2.get());
-
-            // (newVar)
-            std::vector<OwnedPtr<FuncArg>> args;
-            args.emplace_back(CreateFuncArg(std::move(vpRef2)));
-
-            // Return(newVar)
-            auto returnCreation = AST::CreateCallExpr(
-                std::move(re2),
-                std::move(args),
-                returnDecl,
-                handlerRequestTy,
-                CallKind::CALL_DECLARED_FUNCTION
-            );
-            CopyBasicInfo(re2.get(), returnCreation);
-            returnCreation->desugarArgs = {};
-
-            auto typecheckOk = ChkCallExpr(ctx, handlerRequestTy, *returnCreation);
-            CJC_ASSERT(typecheckOk);
-
-            returnExpr->expr = std::move(returnCreation);
-        } else {
-            returnExpr->expr = std::move(vpRef2);
-        }
         returnExpr->expr = std::move(vpRef2);
         returnExpr->refFuncBody = tryLambda->funcBody;
-
-
         returnExpr->ty = TypeManager::GetNothingTy();
         CopyNodeScopeInfo(returnExpr, tryExpr);
 
@@ -695,6 +371,9 @@ void TypeChecker::TypeCheckerImpl::EncloseTryLambda(ASTContext& ctx, OwnedPtr<AS
         wildcard->ty = excAccess->ty;
 
         // Exception()
+        auto exceptionDecl = importManager.GetCoreDecl<ClassDecl>(CLASS_EXCEPTION);
+        CJC_NULLPTR_CHECK(exceptionDecl);
+        auto exceptionType = exceptionDecl->ty;
         auto excInitDecl = GetDefaultInitDecl(*exceptionDecl);
         OwnedPtr<RefExpr> re23 = CreateRefExpr("Exception");
         CopyBasicInfo(innerBlock, re23.get());
@@ -726,6 +405,11 @@ void TypeChecker::TypeCheckerImpl::EncloseTryLambda(ASTContext& ctx, OwnedPtr<AS
         auto vRef = CreateRefExpr(*vp->varDecl);
         AST::CopyNodeScopeInfo(vRef, tryExpr);
 
+        // throw v
+        auto reThrowExpr = MakeOwned<ThrowExpr>();
+        reThrowExpr->expr = std::move(vRef);
+        reThrowExpr->ty = TypeManager::GetNothingTy();
+
         // `if (HandlerFrame.getActiveFrame() == v.frame) {
         // `     match (e.result) {
         // `          case newVar : T => return newVar
@@ -740,61 +424,7 @@ void TypeChecker::TypeCheckerImpl::EncloseTryLambda(ASTContext& ctx, OwnedPtr<AS
         thenBlock->ty = TypeManager::GetNothingTy();
 
         std::vector<OwnedPtr<Node>> elseBlockNodes;
-        
-        if (isDeferred) {
-            // Throw
-            OwnedPtr<RefExpr> re2 = CreateRefExpr("Throw");
-            re2->isAlone = false;
-            re2->ref.target = throwDecl;
-            re2->ty = throwDecl->ty;
-
-            CJC_ASSERT(re2->ref.target);
-            re2->ref.targets.emplace_back(StaticCast<FuncDecl*>(re2->ref.target));
-
-            CopyBasicInfo(innerBlock, re2.get());
-
-            // We use this variable to be able to typecheck the call expression
-            auto exceptIndirectionVarDecl = CreateVarDecl(V_COMPILER, std::move(vRef));
-            AST::CopyNodeScopeInfo(re2, exceptIndirectionVarDecl);
-            auto exceptIndirection = CreateRefExpr(*exceptIndirectionVarDecl);
-            exceptIndirection->ty = exceptionType;
-            AST::CopyNodeScopeInfo(re2, exceptIndirection);
-
-            // (v)
-            std::vector<OwnedPtr<FuncArg>> args;
-            args.emplace_back(CreateFuncArg(std::move(exceptIndirection)));
-
-            // Throw(v)
-            auto throwCreation = AST::CreateCallExpr(
-                std::move(re2),
-                std::move(args),
-                throwDecl,
-                handlerRequestTy,
-                CallKind::CALL_DECLARED_FUNCTION
-            );
-            CopyBasicInfo(re2.get(), throwCreation);
-            throwCreation->desugarArgs = {};
-
-            auto typecheckOk = ChkCallExpr(ctx, handlerRequestTy, *throwCreation);
-            CJC_ASSERT(typecheckOk);
-
-            // return Throw(v)
-            auto returnExpr2 = MakeOwnedNode<ReturnExpr>();
-            returnExpr2->expr = std::move(throwCreation);
-            returnExpr2->refFuncBody = tryLambda->funcBody;
-            CopyNodeScopeInfo(re2, returnExpr2);
-
-            (void)elseBlockNodes.emplace_back(std::move(exceptIndirectionVarDecl));
-            (void)elseBlockNodes.emplace_back(std::move(returnExpr2));
-        } else {
-            // throw v
-            auto reThrowExpr = MakeOwned<ThrowExpr>();
-            reThrowExpr->expr = std::move(vRef);
-            reThrowExpr->ty = TypeManager::GetNothingTy();
-
-            (void)elseBlockNodes.emplace_back(std::move(reThrowExpr));
-        }
-
+        (void)elseBlockNodes.emplace_back(std::move(reThrowExpr));
         auto elseBlock = CreateBlock(std::move(elseBlockNodes));
         elseBlock->ty = TypeManager::GetNothingTy();
 
@@ -853,9 +483,14 @@ void TypeChecker::TypeCheckerImpl::EncloseTryLambda(ASTContext& ctx, OwnedPtr<AS
 */
 VarDecl& TypeChecker::TypeCheckerImpl::CreateFrame(ASTContext& ctx, TryExpr& te, std::vector<OwnedPtr<Node>>& block)
 {
-    bool needsDeferredFrame = te.HasDeferredHandlers();
     // If no handlers use a resumption, we don't need to install a full frame
-    auto frameClassName = needsDeferredFrame ? CLASS_DEFERRED_FRAME : CLASS_IMMEDIATE_FRAME;
+    auto frameClassName = CLASS_IMMEDIATE_FRAME;
+    for (auto& h : te.handlers) {
+        if (!h.IsImmediate()) {
+            frameClassName = CLASS_DEFERRED_FRAME;
+            break;
+        }
+    }
     // To: Frame({=> try{...} catch{...}})
     auto lambdaTy = DynamicCast<FuncTy*>(te.tryLambda->ty);
     CJC_NULLPTR_CHECK(lambdaTy);
@@ -873,7 +508,7 @@ VarDecl& TypeChecker::TypeCheckerImpl::CreateFrame(ASTContext& ctx, TryExpr& te,
     re->ty = frameClassTy;
     re->instTys.push_back(tryExprTy);
 
-    EncloseTryLambda(ctx, te.tryLambda, needsDeferredFrame);
+    EncloseTryLambda(ctx, te.tryLambda);
 
     // We cannot just pass the lambda directly to the constructor, because then the call
     // to ChkCallExpr would delete the desugaring information, so we bind the lambda to
@@ -890,7 +525,7 @@ VarDecl& TypeChecker::TypeCheckerImpl::CreateFrame(ASTContext& ctx, TryExpr& te,
     std::vector<OwnedPtr<FuncArg>> args;
     args.emplace_back(CreateFuncArg(std::move(lambdaVar)));
     auto frameCreation = AST::CreateCallExpr(
-        std::move(frameInit), std::move(args), frameDecl, frameClassTy, CallKind::CALL_OBJECT_CREATION);
+        std::move(frameInit), std::move(args), nullptr, frameClassTy, CallKind::CALL_OBJECT_CREATION);
     frameCreation->desugarArgs = {};
     auto typecheckOk = ChkCallExpr(ctx, frameClassTy, *frameCreation);
     CJC_ASSERT(typecheckOk);
@@ -1379,7 +1014,7 @@ void TypeChecker::TypeCheckerImpl::DesugarTryToFrame(ASTContext& ctx, TryExpr& t
     te.desugarExpr = std::move(dummyBlock);
 }
 
-OwnedPtr<AST::MemberAccess> TypeChecker::TypeCheckerImpl::GetHelperFrameMethod(
+OwnedPtr<Expr> TypeChecker::TypeCheckerImpl::GetHelperFrameMethod(
     AST::Node& base, const std::string& methodName, std::vector<Ptr<Ty>> typeArgs)
 {
     auto frameDecl = importManager.GetImportedDecl<ClassDecl>(EFFECT_INTERNALS_PACKAGE_NAME, CLASS_HANDLER_FRAME);
@@ -1419,12 +1054,9 @@ void TypeChecker::TypeCheckerImpl::DesugarPerform(ASTContext& ctx, AST::PerformE
 
     std::vector<OwnedPtr<FuncArg>> args;
     args.emplace_back(CreateFuncArg(std::move(pe.expr)));
-    perfMethod->ty = typeManager.GetFunctionTy({cmdTy}, resultTy);
-    auto funcDecl = StaticCast<FuncDecl*>(perfMethod->target);
-    auto perfCall = CreateCallExpr(std::move(perfMethod), std::move(args), funcDecl, resultTy);
-    // auto typecheckOk = ChkCallExpr(ctx, pe.ty, *perfCall);                                    // Are these necessary?
-    // CJC_ASSERT(typecheckOk);
-    (void)ctx;                                                                                   // what does this do???
+    auto perfCall = CreateCallExpr(std::move(perfMethod), std::move(args));
+    auto typecheckOk = ChkCallExpr(ctx, pe.ty, *perfCall);
+    CJC_ASSERT(typecheckOk);
     // Checking for a call expr may get rid of some desugarings
     DesugarForPropDecl(*perfCall);
 
